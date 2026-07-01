@@ -27,6 +27,12 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*
 
+# Caddy — optional host-based edge proxy when PROXY_HOST_ROUTES is set (Railway
+# exposes one $PORT; Caddy routes custom domains to internal Hermes API ports).
+ARG CADDY_VERSION=2.9.1
+RUN curl -fsSL "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_linux_amd64.tar.gz" \
+    | tar -xz -C /usr/bin caddy
+
 # Install hermes-agent (provides the `hermes` CLI) and pre-build its React
 # dashboard so `hermes dashboard` has nothing to build at runtime.
 #
@@ -87,8 +93,9 @@ RUN mkdir -p /data/.hermes
 
 COPY server.py /app/server.py
 COPY templates/ /app/templates/
+COPY scripts/ /app/scripts/
 COPY start.sh /app/start.sh
-RUN chmod +x /app/start.sh
+RUN chmod +x /app/start.sh /app/scripts/render-caddyfile.sh
 
 ENV HOME=/data
 ENV HERMES_HOME=/data/.hermes

@@ -1570,7 +1570,9 @@ app = Starlette(routes=routes, lifespan=lifespan)
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", "8080"))
+    # When Caddy fronts the container (PROXY_HOST_ROUTES), it owns $PORT and we
+    # bind ADMIN_INTERNAL_PORT instead. Without that, Railway's $PORT is us.
+    port = int(os.environ.get("ADMIN_INTERNAL_PORT") or os.environ.get("PORT", "8080"))
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info", loop="asyncio")

@@ -64,6 +64,8 @@ Message your Telegram bot. If you're a new user, a pairing request will appear i
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `8080` | Web server port (set automatically by Railway) |
+| `PROXY_HOST_ROUTES` | *(unset)* | Comma-separated `hostname:internal_port` pairs for Caddy host routing — see [Multiple domains on one port](#multiple-domains-on-one-port) |
+| `ADMIN_INTERNAL_PORT` | `8080` | Port for the admin server when `PROXY_HOST_ROUTES` is set (Caddy owns `$PORT`) |
 | `ADMIN_USERNAME` | `admin` | Basic auth username |
 | `ADMIN_PASSWORD` | *(auto-generated)* | Basic auth password — if unset, a random password is printed to logs |
 | `HERMES_REF` | *(pinned in Dockerfile)* | Hermes Agent version to install (any upstream git tag/branch). Set this to override the Dockerfile default without editing code — see [Updating Hermes](#updating-hermes). |
@@ -94,6 +96,67 @@ Railway Container
 ```
 
 The admin server runs on `$PORT` and manages the Hermes gateway as a child process. Config is stored in `/data/.hermes/.env` and `/data/.hermes/config.yaml`. Gateway stdout/stderr is captured into a ring buffer and streamed to the Logs panel.
+
+## Multiple domains on one port
+
+Railway exposes **one HTTP port** per service (`$PORT`). To reach two internal apps (for example Hermes API servers on **8642** and **8643**) via different hostnames, enable the built-in **Caddy** edge proxy.
+
+### 1. Make each Hermes API server reachable inside the container
+
+In `/data/.hermes/.env` (or per-profile `.env` if you run multiple gateways), each API server must listen on all interfaces — not loopback:
+
+```bash
+API_SERVER_ENABLED=true
+API_SERVER_HOST=0.0.0.0
+API_SERVER_PORT=8642          # use 8643 in the second profile's .env
+API_SERVER_KEY=<random-secret> # openssl rand -hex 32
+```
+
+Without `API_SERVER_HOST=0.0.0.0`, Caddy cannot forward traffic to the gateway even though the port is open on localhost.
+
+### 2. Tell the container how to route hostnames
+
+Set `PROXY_HOST_ROUTES` on the Railway service (comma-separated `host:port`):
+
+```bash
+PROXY_HOST_ROUTES=api-one.example.com:8642,api-two.example.com:8643
+```
+
+On boot, Caddy listens on Railway's `$PORT` and forwards:
+
+| Host header | Internal backend |
+|-------------|------------------|
+| `api-one.example.com` | `127.0.0.1:8642` |
+| `api-two.example.com` | `127.0.0.1:8643` |
+| anything else (including the default `*.up.railway.app` URL) | admin UI on `:8080` |
+
+`ADMIN_INTERNAL_PORT` defaults to `8080`; change it only if that port conflicts with another process.
+
+### 3. Add custom domains in Railway
+
+For each public hostname:
+
+1. Open **Service → Settings → Networking → Custom Domain**
+2. Add the domain (e.g. `api-one.example.com`, `api-two.example.com`)
+3. Point your DNS CNAME at Railway's target
+
+Railway terminates TLS at the edge; Caddy inside the container speaks plain HTTP on `$PORT`.
+
+Keep the default Railway domain on the service for the **admin dashboard** (`/setup`, `/health`). Point custom domains only at the API hostnames you listed in `PROXY_HOST_ROUTES`.
+
+### Local smoke test
+
+```bash
+docker build -t hermes-agent .
+docker run --rm -p 8080:8080 \
+  -e PORT=8080 \
+  -e PROXY_HOST_ROUTES='api.localtest.me:8642,api2.localtest.me:8643' \
+  -e ADMIN_PASSWORD=changeme \
+  -v hermes-data:/data \
+  hermes-agent
+```
+
+`localtest.me` resolves to `127.0.0.1`, so you can curl `http://api.localtest.me:8080/health` (gateway) vs `http://127.0.0.1:8080/health` (admin) after enabling the API server in `.env`.
 
 ## Running Locally
 

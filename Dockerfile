@@ -50,6 +50,16 @@ RUN git clone --depth 1 --branch ${HERMES_REF} https://github.com/NousResearch/h
     npm run build && \
     rm -rf /opt/hermes-agent/web /opt/hermes-agent/.git /root/.npm
 
+# Runtime file-editing utilities (must survive in the final image — not build-only).
+# - ripgrep: backs Hermes search_files (without it the tool falls back to slower grep
+#   or fails on wide trees). Shipped in the official nousresearch/hermes-agent image.
+# - vim: $EDITOR for docker exec, hermes config edit, and TUI Ctrl+G.
+# - patch: GNU patch for terminal workflows that apply unified diffs outside the
+#   Python patch tool.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ripgrep vim patch && \
+    rm -rf /var/lib/apt/lists/*
+
 # Why pre-build ui-tui (and why we don't delete it after):
 # - The dashboard's embedded Chat tab spawns `node ui-tui/dist/entry.js`
 #   on every WebSocket connect to /api/pty.
@@ -81,6 +91,7 @@ ENV HERMES_HOME=/data/.hermes
 # and avoids the 30-60s npm bootstrap that git-editable installs would otherwise
 # trigger on first /chat connection.
 ENV HERMES_TUI_DIR=/opt/hermes-agent/ui-tui
+ENV EDITOR=vim
 
 # tini wraps start.sh so it runs as PID 1's child instead of as PID 1 itself.
 # `-g` propagates signals to the whole process group so `docker stop` /

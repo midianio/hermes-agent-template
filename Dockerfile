@@ -19,8 +19,8 @@ ARG HERMES_REF=v2026.6.19
 # stop signal still triggers our graceful shutdown. Standard container init
 # (same as Docker's `--init` flag and Kubernetes' pause container).
 #
-# Node.js is required only at build time to compile the Hermes React dashboard.
-# We strip the source + apt lists afterwards to keep the image lean.
+# Node.js is required at build time (Hermes React/TUI dashboards) and at runtime
+# for the Raft platform CLI (`raft agent bridge`, `raft message *`).
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl ca-certificates git tini && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
@@ -59,6 +59,14 @@ RUN git clone --depth 1 --branch ${HERMES_REF} https://github.com/NousResearch/h
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ripgrep vim patch && \
     rm -rf /var/lib/apt/lists/*
+
+# Raft platform CLI (https://raft.build). Hermes' raft adapter checks PATH for
+# `raft`, spawns `raft agent bridge`, and expects the agent to use `raft message`
+# commands. Pin with RAFT_CLI_VERSION build-arg; bump from npm when upgrading.
+# Setup after deploy: `raft agent login ...` then set RAFT_PROFILE in /data/.hermes/.env
+ARG RAFT_CLI_VERSION=0.0.15
+RUN npm install -g "@botiverse/raft@${RAFT_CLI_VERSION}" && \
+    npm cache clean --force
 
 # Why pre-build ui-tui (and why we don't delete it after):
 # - The dashboard's embedded Chat tab spawns `node ui-tui/dist/entry.js`

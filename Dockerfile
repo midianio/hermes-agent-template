@@ -62,8 +62,10 @@ RUN git clone --depth 1 --branch ${HERMES_REF} https://github.com/NousResearch/h
 # - vim: $EDITOR for docker exec, hermes config edit, and TUI Ctrl+G.
 # - patch: GNU patch for terminal workflows that apply unified diffs outside the
 #   Python patch tool.
+# - jq: JSON wrangling for the agent + used below to resolve the midas release asset.
+# - xz-utils: tar can't extract the .tar.xz midas release archives without it.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ripgrep vim patch && \
+    apt-get install -y --no-install-recommends ripgrep vim patch jq xz-utils && \
     rm -rf /var/lib/apt/lists/*
 
 # Raft platform CLI (https://raft.build). Hermes' raft adapter checks PATH for
@@ -73,6 +75,54 @@ RUN apt-get update && \
 ARG RAFT_CLI_VERSION=0.0.15
 RUN npm install -g "@botiverse/raft@${RAFT_CLI_VERSION}" && \
     npm cache clean --force
+
+# Obsidian headless client (https://obsidian.md/help/publish/headless). Provides
+# the `ob` binary — the ONLY Obsidian CLI that runs without the desktop app.
+# One package covers login, Sync, AND Publish (`ob login`, `ob sync`, `ob publish`).
+# Requires Node 22+ (installed above). Currently in open beta; pin and bump the
+# ARG deliberately after checking `npm view obsidian-headless version`.
+#
+# Setup after deploy (one time — HOME=/data is the persistent volume, so the
+# credentials in ~/.config survive restarts and redeploys):
+#   ob login
+#   ob publish-list-sites            # then, inside the vault directory:
+#   ob publish-setup --site "<site>" # and `ob publish` to deploy
+# Requires an active Obsidian Publish (and/or Sync) subscription.
+ARG OBSIDIAN_HEADLESS_VERSION=0.0.12
+RUN npm install -g "obsidian-headless@${OBSIDIAN_HEADLESS_VERSION}" && \
+    npm cache clean --force
+
+# midas — Midian's CLI (private repo: github.com/midianio/midas). Prebuilt Linux
+# binaries are published to GitHub releases by cargo-dist, so we download instead
+# of compiling Rust here.
+#
+# MIDAS_GITHUB_TOKEN: Railway doesn't support BuildKit `--mount=type=secret`, so
+# the token comes in as a build ARG (declare it as a Railway service variable and
+# it's injected at build time). ARG values used in RUN are recoverable from image
+# history — use a fine-grained PAT scoped to ONLY midianio/midas with read-only
+# Contents permission, nothing else, and rotate it periodically. Leave it unset
+# to skip the midas install entirely (image still builds).
+ARG MIDAS_VERSION=0.1.2
+ARG MIDAS_GITHUB_TOKEN=
+RUN set -eu; \
+    if [ -z "${MIDAS_GITHUB_TOKEN}" ]; then \
+        echo "MIDAS_GITHUB_TOKEN not set — skipping midas install"; exit 0; \
+    fi; \
+    arch="$(uname -m)"; \
+    case "$arch" in x86_64|aarch64) ;; *) echo "unsupported arch: $arch" >&2; exit 1 ;; esac; \
+    asset="midas-${arch}-unknown-linux-gnu.tar.xz"; \
+    asset_id="$(curl -fsSL -H "Authorization: Bearer ${MIDAS_GITHUB_TOKEN}" \
+        "https://api.github.com/repos/midianio/midas/releases/tags/${MIDAS_VERSION}" \
+        | jq -r --arg name "$asset" '.assets[] | select(.name == $name) | .id')"; \
+    [ -n "$asset_id" ] && [ "$asset_id" != "null" ] || { echo "asset $asset not found in release ${MIDAS_VERSION}" >&2; exit 1; }; \
+    curl -fsSL -H "Authorization: Bearer ${MIDAS_GITHUB_TOKEN}" \
+        -H "Accept: application/octet-stream" \
+        "https://api.github.com/repos/midianio/midas/releases/assets/${asset_id}" \
+        -o /tmp/midas.tar.xz; \
+    tar -xJf /tmp/midas.tar.xz -C /tmp; \
+    install -m 0755 "/tmp/midas-${arch}-unknown-linux-gnu/midas" /usr/local/bin/midas; \
+    rm -rf /tmp/midas.tar.xz "/tmp/midas-${arch}-unknown-linux-gnu"; \
+    midas --version
 
 # Why pre-build ui-tui (and why we don't delete it after):
 # - The dashboard's embedded Chat tab spawns `node ui-tui/dist/entry.js`

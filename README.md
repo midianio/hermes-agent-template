@@ -69,8 +69,24 @@ Message your Telegram bot. If you're a new user, a pairing request will appear i
 | `ADMIN_USERNAME` | `admin` | Basic auth username |
 | `ADMIN_PASSWORD` | *(auto-generated)* | Basic auth password — if unset, a random password is printed to logs |
 | `HERMES_REF` | *(pinned in Dockerfile)* | Hermes Agent version to install (any upstream git tag/branch). Set this to override the Dockerfile default without editing code — see [Updating Hermes](#updating-hermes). |
+| `MIDAS_GITHUB_TOKEN` | *(unset)* | Build-time only: fine-grained GitHub PAT with read-only **Contents** access to `midianio/midas`, used to download the `midas` release binary into the image. If unset, the midas install is skipped and the image still builds. |
+| `MIDAS_VERSION` | *(pinned in Dockerfile)* | midas release tag to bake into the image. |
+| `OBSIDIAN_HEADLESS_VERSION` | *(pinned in Dockerfile)* | [`obsidian-headless`](https://obsidian.md/help/publish/headless) npm version (`ob` CLI for Obsidian Sync/Publish without the desktop app). |
 
 All other configuration (LLM provider, model, channels, tools) is managed through the admin dashboard.
+
+### Baked-in agent CLIs
+
+The image ships with `midas` (Midian's CLI) and `ob` (Obsidian headless Sync/Publish) so the agent can use them without any per-restart install. `ob` needs a one-time login after first deploy — credentials land under `$HOME` (`/data`, the persistent volume) and survive restarts/redeploys:
+
+```
+ob login
+ob publish-list-sites
+cd <vault> && ob publish-setup --site "<site>"
+ob publish            # or: ob publish --dry-run
+```
+
+Requires an active Obsidian Publish (and/or Sync) subscription.
 
 ## Supported Providers
 

@@ -70,7 +70,7 @@ Message your Telegram bot. If you're a new user, a pairing request will appear i
 | `ADMIN_PASSWORD` | *(auto-generated)* | Basic auth password — if unset, a random password is printed to logs |
 | `HERMES_REF` | *(pinned in Dockerfile)* | Hermes Agent version to install (any upstream git tag/branch). Set this to override the Dockerfile default without editing code — see [Updating Hermes](#updating-hermes). |
 | `MIDAS_GITHUB_TOKEN` | *(unset)* | Build-time only: fine-grained GitHub PAT with read-only **Contents** access to `midianio/midas`, used to download the `midas` release binary into the image. If unset, the midas install is skipped and the image still builds. |
-| `MIDAS_VERSION` | *(pinned in Dockerfile)* | midas release tag to bake into the image. |
+| `MIDAS_VERSION` | `latest` | midas release to bake into the image. Defaults to the newest GitHub release at build time; set a release tag (e.g. `0.1.2`) to pin. |
 | `OBSIDIAN_HEADLESS_VERSION` | *(pinned in Dockerfile)* | [`obsidian-headless`](https://obsidian.md/help/publish/headless) npm version (`ob` CLI for Obsidian Sync/Publish without the desktop app). |
 
 All other configuration (LLM provider, model, channels, tools) is managed through the admin dashboard.
@@ -185,9 +185,9 @@ Open `http://localhost:8080` and log in with `admin` / `changeme`.
 
 ## Updating Hermes
 
-This template pins a specific Hermes Agent release in the `Dockerfile` (`ARG HERMES_REF`, currently `v2026.6.19`). To upgrade:
+This template pins a specific Hermes Agent release in the `Dockerfile` (`ARG HERMES_REF`, currently `v2026.7.1`). To upgrade:
 
-- **Recommended:** set a `HERMES_REF` service variable in Railway to any upstream [release tag](https://github.com/NousResearch/hermes-agent/releases) (e.g. `v2026.6.19`), then redeploy. It's passed in as a Docker build arg and overrides the Dockerfile default — no code change needed.
+- **Recommended:** set a `HERMES_REF` service variable in Railway to any upstream [release tag](https://github.com/NousResearch/hermes-agent/releases) (e.g. `v2026.7.1`), then redeploy. It's passed in as a Docker build arg and overrides the Dockerfile default — no code change needed.
 - **Or** bump `ARG HERMES_REF` in the `Dockerfile` and redeploy.
 
 The "Update" button inside the Hermes dashboard is a **no-op on Railway** (it detects a container install and refuses) — the image is immutable, so a runtime self-update wouldn't survive a redeploy. Bump `HERMES_REF` and redeploy instead. When jumping releases, re-check that the Dockerfile's install extras still match upstream's `pyproject.toml`.

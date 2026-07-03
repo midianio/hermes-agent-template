@@ -96,13 +96,19 @@ RUN npm install -g "obsidian-headless@${OBSIDIAN_HEADLESS_VERSION}" && \
 # binaries are published to GitHub releases by cargo-dist, so we download instead
 # of compiling Rust here.
 #
+# MIDAS_VERSION defaults to `latest`, which resolves the newest GitHub release at
+# build time. Set it to a release tag (e.g. `0.1.2`) to pin. Caveat: Docker layer
+# caching can freeze "latest" at whatever it resolved to when this layer was last
+# built — rebuild with --no-cache (or change any ARG in this stage) to force a
+# re-resolve.
+#
 # MIDAS_GITHUB_TOKEN: Railway doesn't support BuildKit `--mount=type=secret`, so
 # the token comes in as a build ARG (declare it as a Railway service variable and
 # it's injected at build time). ARG values used in RUN are recoverable from image
 # history — use a fine-grained PAT scoped to ONLY midianio/midas with read-only
 # Contents permission, nothing else, and rotate it periodically. Leave it unset
 # to skip the midas install entirely (image still builds).
-ARG MIDAS_VERSION=0.1.2
+ARG MIDAS_VERSION=latest
 ARG MIDAS_GITHUB_TOKEN=
 RUN set -eu; \
     if [ -z "${MIDAS_GITHUB_TOKEN}" ]; then \
@@ -111,10 +117,16 @@ RUN set -eu; \
     arch="$(uname -m)"; \
     case "$arch" in x86_64|aarch64) ;; *) echo "unsupported arch: $arch" >&2; exit 1 ;; esac; \
     asset="midas-${arch}-unknown-linux-gnu.tar.xz"; \
-    asset_id="$(curl -fsSL -H "Authorization: Bearer ${MIDAS_GITHUB_TOKEN}" \
-        "https://api.github.com/repos/midianio/midas/releases/tags/${MIDAS_VERSION}" \
-        | jq -r --arg name "$asset" '.assets[] | select(.name == $name) | .id')"; \
-    [ -n "$asset_id" ] && [ "$asset_id" != "null" ] || { echo "asset $asset not found in release ${MIDAS_VERSION}" >&2; exit 1; }; \
+    if [ "${MIDAS_VERSION}" = "latest" ]; then \
+        release_url="https://api.github.com/repos/midianio/midas/releases/latest"; \
+    else \
+        release_url="https://api.github.com/repos/midianio/midas/releases/tags/${MIDAS_VERSION}"; \
+    fi; \
+    release_json="$(curl -fsSL -H "Authorization: Bearer ${MIDAS_GITHUB_TOKEN}" "$release_url")"; \
+    tag="$(printf '%s' "$release_json" | jq -r '.tag_name')"; \
+    asset_id="$(printf '%s' "$release_json" | jq -r --arg name "$asset" '.assets[] | select(.name == $name) | .id')"; \
+    [ -n "$asset_id" ] && [ "$asset_id" != "null" ] || { echo "asset $asset not found in release ${tag}" >&2; exit 1; }; \
+    echo "installing midas ${tag} (${asset})"; \
     curl -fsSL -H "Authorization: Bearer ${MIDAS_GITHUB_TOKEN}" \
         -H "Accept: application/octet-stream" \
         "https://api.github.com/repos/midianio/midas/releases/assets/${asset_id}" \

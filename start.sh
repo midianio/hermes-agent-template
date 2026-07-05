@@ -48,16 +48,11 @@ fi
 # container), so removing the file unconditionally is safe.
 rm -f /data/.hermes/gateway.pid
 
-# Optional edge reverse proxy (Caddy) on Railway's $PORT. Routes custom domains
-# to internal backends (e.g. Hermes API servers on 8642/8643) while the default
-# hostname keeps serving the admin UI + dashboard proxy.
-if [ -n "${PROXY_HOST_ROUTES:-}" ]; then
-  export ADMIN_INTERNAL_PORT="${ADMIN_INTERNAL_PORT:-8080}"
-  /app/scripts/render-caddyfile.sh
-  python /app/server.py &
-  PY_PID=$!
-  trap 'kill -TERM "${PY_PID}" 2>/dev/null; wait "${PY_PID}" 2>/dev/null || true' EXIT
-  exec caddy run --config /tmp/Caddyfile --adapter caddyfile
-fi
-
-exec python /app/server.py
+# Caddy on Railway's $PORT: admin UI at /setup, hermes serve for Desktop + web UI.
+export ADMIN_INTERNAL_PORT="${ADMIN_INTERNAL_PORT:-8080}"
+export HERMES_SERVE_PORT="${HERMES_SERVE_PORT:-9120}"
+/app/scripts/render-caddyfile.sh
+python /app/server.py &
+PY_PID=$!
+trap 'kill -TERM "${PY_PID}" 2>/dev/null; wait "${PY_PID}" 2>/dev/null || true' EXIT
+exec caddy run --config /tmp/Caddyfile --adapter caddyfile

@@ -1,19 +1,23 @@
 #!/bin/bash
-# Generate /tmp/Caddyfile for host-based routing on Railway's single $PORT.
-#
-# PROXY_HOST_ROUTES — comma-separated host:port pairs, e.g.
-#   api-one.example.com:8642,api-two.example.com:8643
-# Each hostname is matched on the Host header (port suffix ignored by Caddy).
-# Unmatched hosts fall through to the admin server on ADMIN_INTERNAL_PORT.
+# Generate /tmp/Caddyfile — Caddy listens on Railway's $PORT and routes:
+#   /setup, /health, /login  → admin server (ADMIN_INTERNAL_PORT)
+#   optional host routes     → Hermes API servers (PROXY_HOST_ROUTES)
+#   everything else          → hermes serve (HERMES_SERVE_PORT) for Desktop + web UI
 set -euo pipefail
 
 ADMIN_PORT="${ADMIN_INTERNAL_PORT:-8080}"
-LISTEN_PORT="${PORT:-8080}"
+SERVE_PORT="${HERMES_SERVE_PORT:-9120}"
+LISTEN_PORT="${PORT:-9119}"
 ROUTES="${PROXY_HOST_ROUTES:-}"
 
 {
   printf '%s\n' '{' '    auto_https off' '    admin off' '}'
   printf '\n:%s {\n' "${LISTEN_PORT}"
+
+  printf '    @admin path /health /health/* /login /login/* /logout /logout/* /setup /setup/*\n'
+  printf '    handle @admin {\n'
+  printf '        reverse_proxy 127.0.0.1:%s\n' "${ADMIN_PORT}"
+  printf '    }\n\n'
 
   idx=0
   if [ -n "${ROUTES}" ]; then
@@ -37,9 +41,9 @@ ROUTES="${PROXY_HOST_ROUTES:-}"
   fi
 
   printf '    handle {\n'
-  printf '        reverse_proxy 127.0.0.1:%s\n' "${ADMIN_PORT}"
+  printf '        reverse_proxy 127.0.0.1:%s\n' "${SERVE_PORT}"
   printf '    }\n'
   printf '}\n'
 } > /tmp/Caddyfile
 
-echo "[caddy] wrote /tmp/Caddyfile (listen :${LISTEN_PORT}, ${idx} host route(s), default → :${ADMIN_PORT})" >&2
+echo "[caddy] wrote /tmp/Caddyfile (listen :${LISTEN_PORT}, admin → :${ADMIN_PORT}, serve → :${SERVE_PORT}, ${idx} API route(s))" >&2

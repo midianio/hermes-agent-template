@@ -4,21 +4,17 @@ Hermes Agent — Railway admin server.
 Responsibilities:
   - Admin UI / setup wizard at /setup (Starlette + Jinja, cookie-auth guarded)
   - Management API at /setup/api/* (config, status, logs, gateway, pairing)
-  - Reverse proxy at / and /* → native Hermes dashboard (hermes_cli/web_server, on 127.0.0.1:9119)
-  - Managed subprocesses: `hermes gateway` (agent) and `hermes dashboard` (native UI)
-  - Cookie-based session auth at /login (HMAC-signed, 7-day expiry, httponly)
+  - Managed subprocesses: `hermes gateway` (messaging agent) and `hermes serve`
+    (headless backend for Hermes Desktop + browser dashboard on HERMES_SERVE_PORT)
+  - Cookie-based session auth at /login for the admin UI (HMAC-signed, 7-day expiry)
 
-Auth model: Basic Auth was dropped in favor of cookies because the Hermes React
-SPA's plain fetch() calls do not reliably include basic-auth creds across browsers,
-and basic-auth's per-directory protection space forced separate prompts for
-/setup and /. Cookies auto-include on every same-origin request, so both the
-setup UI and the proxied dashboard work with a single login. The cookie signing
-secret is regenerated on every process start, so any ADMIN_PASSWORD change on
-Railway (which triggers a redeploy) invalidates all existing sessions.
+Public traffic on Railway's $PORT is handled by Caddy (see start.sh):
+  /setup, /health, /login → this admin server (ADMIN_INTERNAL_PORT)
+  everything else         → `hermes serve` (HERMES_SERVE_PORT) with Hermes auth
 
-First-visit behavior: if no provider+model config exists, GET / redirects to /setup.
-Once configured, / proxies to the Hermes dashboard. A small "← Setup" widget is
-injected into every proxied HTML response so users can always return to the wizard.
+Configure HERMES_DASHBOARD_BASIC_AUTH_* or OAuth in /data/.hermes/.env so Desktop
+and browser clients can sign in to the serve backend. Set HERMES_DASHBOARD_PUBLIC_URL
+to your Railway URL when using OAuth behind Caddy.
 """
 
 # PEP 563 lazy annotations: keeps function/parameter type hints as strings so
@@ -40,8 +36,6 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
-import websockets
-import websockets.exceptions
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import (
@@ -50,9 +44,8 @@ from starlette.responses import (
     RedirectResponse,
     Response,
 )
-from starlette.routing import Route, WebSocketRoute
+from starlette.routing import Route
 from starlette.templating import Jinja2Templates
-from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
@@ -62,18 +55,11 @@ ENV_FILE = Path(HERMES_HOME) / ".env"
 PAIRING_DIR = Path(HERMES_HOME) / "pairing"
 PAIRING_TTL = 3600
 
-# Native Hermes dashboard — runs on loopback, fronted by our reverse proxy.
-HERMES_DASHBOARD_HOST = "127.0.0.1"
-HERMES_DASHBOARD_PORT = int(os.environ.get("HERMES_DASHBOARD_PORT", "9119"))
-HERMES_DASHBOARD_URL = f"http://{HERMES_DASHBOARD_HOST}:{HERMES_DASHBOARD_PORT}"
-
-# Mirror dashboard-ref-only/auth_proxy.py: strip only `host` (httpx sets it)
-# and `transfer-encoding` (httpx recomputes it from the body). Keep everything
-# else — notably `authorization`, because the SPA uses Bearer tokens against
-# hermes's own /api/env/reveal and OAuth endpoints, and keep `cookie` since
-# some hermes endpoints read it. Aggressive stripping was masking requests in
-# ways that produced spurious 401s.
-HOP_BY_HOP = {"host", "transfer-encoding"}
+# Headless Hermes backend — Caddy on $PORT forwards public traffic here.
+# Binds 0.0.0.0 so Hermes's dashboard auth gate engages (required for Desktop).
+HERMES_SERVE_HOST = os.environ.get("HERMES_SERVE_HOST", "0.0.0.0")
+HERMES_SERVE_PORT = int(os.environ.get("HERMES_SERVE_PORT", "9120"))
+HERMES_SERVE_URL = f"http://{HERMES_SERVE_HOST}:{HERMES_SERVE_PORT}"
 
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
@@ -909,18 +895,27 @@ gw = Gateway()
 cfg_lock = asyncio.Lock()
 
 
-# ── Hermes dashboard subprocess ───────────────────────────────────────────────
-class Dashboard:
-    """Manages the `hermes dashboard` subprocess (native Hermes web UI).
+# ── Hermes serve subprocess ───────────────────────────────────────────────────
+def _serve_auth_configured() -> bool:
+    """True when a Hermes dashboard auth provider is configured for serve."""
+    data = read_env(ENV_FILE) if ENV_FILE.exists() else {}
+    merged = {**data, **{k: v for k, v in os.environ.items() if k.startswith("HERMES_DASHBOARD_")}}
+    if merged.get("HERMES_DASHBOARD_OAUTH_CLIENT_ID") or merged.get("HERMES_DASHBOARD_OIDC_ISSUER"):
+        return True
+    user = (merged.get("HERMES_DASHBOARD_BASIC_AUTH_USERNAME") or "").strip()
+    if not user:
+        return False
+    return bool(
+        merged.get("HERMES_DASHBOARD_BASIC_AUTH_PASSWORD")
+        or merged.get("HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH")
+    )
 
-    Bound to loopback only — we expose it to the public internet through our
-    reverse proxy on $PORT, where edge basic auth guards every request.
-    The dashboard is independent of the gateway: it reads config files
-    directly and tolerates a stopped gateway.
 
-    All subprocess output is streamed to our stdout (→ Railway logs) with a
-    `[dashboard]` prefix AND retained in a ring buffer for diagnostics.
-    Unexpected exits are explicitly logged with their return code.
+class Serve:
+    """Manages the `hermes serve` subprocess (headless backend for Desktop + web UI).
+
+    Caddy exposes this on Railway's $PORT. Hermes auth (basic or OAuth) must be
+    configured in /data/.hermes/.env when binding a non-loopback address.
     """
 
     def __init__(self):
@@ -931,31 +926,28 @@ class Dashboard:
     async def start(self):
         if self.proc and self.proc.returncode is None:
             return
+        if HERMES_SERVE_HOST not in ("127.0.0.1", "localhost", "::1") and not _serve_auth_configured():
+            print(
+                "[serve] WARNING: binding to "
+                f"{HERMES_SERVE_HOST}:{HERMES_SERVE_PORT} without dashboard auth. "
+                "Set HERMES_DASHBOARD_BASIC_AUTH_* or HERMES_DASHBOARD_OAUTH_CLIENT_ID "
+                "in /data/.hermes/.env — serve may refuse to start.",
+                flush=True,
+            )
         try:
             self.proc = await asyncio.create_subprocess_exec(
-                "hermes", "dashboard",
-                "--host", HERMES_DASHBOARD_HOST,
-                "--port", str(HERMES_DASHBOARD_PORT),
+                "hermes", "serve",
+                "--host", HERMES_SERVE_HOST,
+                "--port", str(HERMES_SERVE_PORT),
                 "--no-open",
-                # --skip-build: the Dockerfile pre-builds the React dashboard
-                # into hermes_cli/web_dist/ at image time. This flag tells
-                # hermes to trust that dist and skip its npm build check,
-                # which would otherwise add ~30s to first startup (hermes >= v2026.5.16).
                 "--skip-build",
-                # NOTE: the embedded Chat tab (/api/pty + /api/ws + /api/events)
-                # is unconditionally enabled as of hermes v2026.6.5 — the old
-                # `--tui` flag was REMOVED from the dashboard subcommand. Passing
-                # it now aborts startup with "unrecognized arguments: --tui",
-                # which kills this subprocess and 503s the reverse proxy. The
-                # Dockerfile still pre-builds ui-tui/dist/ (via HERMES_TUI_DIR)
-                # so the PTY child spawns instantly on first chat connect.
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
-            print(f"[dashboard] spawned pid={self.proc.pid} → {HERMES_DASHBOARD_URL}", flush=True)
+            print(f"[serve] spawned pid={self.proc.pid} → {HERMES_SERVE_URL}", flush=True)
             self._drain_task = asyncio.create_task(self._drain())
         except Exception as e:
-            print(f"[dashboard] FAILED to spawn: {e!r}", flush=True)
+            print(f"[serve] FAILED to spawn: {e!r}", flush=True)
 
     async def _drain(self):
         """Stream subprocess output to Railway logs (prefixed) and a ring buffer."""
@@ -964,19 +956,25 @@ class Dashboard:
             async for raw in self.proc.stdout:
                 line = ANSI_ESCAPE.sub("", raw.decode(errors="replace").rstrip())
                 self.logs.append(line)
-                print(f"[dashboard] {line}", flush=True)
+                print(f"[serve] {line}", flush=True)
         except Exception as e:
-            print(f"[dashboard] drain error: {e!r}", flush=True)
+            print(f"[serve] drain error: {e!r}", flush=True)
         finally:
             rc = self.proc.returncode if self.proc else None
             if rc is not None and rc != 0:
-                print(f"[dashboard] EXITED with code {rc} — reverse proxy will return 503 until restart", flush=True)
+                print(f"[serve] EXITED with code {rc}", flush=True)
             elif rc == 0:
-                print(f"[dashboard] exited cleanly (code 0)", flush=True)
+                print(f"[serve] exited cleanly (code 0)", flush=True)
 
     async def stop(self):
         if not self.proc or self.proc.returncode is not None:
             return
+        if self._drain_task:
+            self._drain_task.cancel()
+            try:
+                await self._drain_task
+            except asyncio.CancelledError:
+                pass
         self.proc.terminate()
         try:
             await asyncio.wait_for(self.proc.wait(), timeout=5)
@@ -985,10 +983,9 @@ class Dashboard:
             await self.proc.wait()
 
 
-dash = Dashboard()
+serve = Serve()
 
-# Shared async HTTP client for the reverse proxy. Created lazily so we pick up
-# the running event loop, torn down in lifespan.
+# Shared async HTTP client for OAuth polling. Created lazily, torn down in lifespan.
 _http_client: httpx.AsyncClient | None = None
 
 
@@ -1198,136 +1195,8 @@ async def api_pairing_revoke(request: Request):
     return JSONResponse({"ok": True})
 
 
-# ── Reverse proxy → Hermes dashboard ──────────────────────────────────────────
-_WIDGET_LINK_STYLE = (
-    "background:rgba(20,24,31,0.92);backdrop-filter:blur(8px);"
-    "border:1px solid #252d3d;border-radius:6px;padding:6px 12px;"
-    "color:#c9d1d9;text-decoration:none;display:inline-flex;"
-    "align-items:center;gap:6px;"
-)
-BACK_TO_SETUP_WIDGET = (
-    '<div id="hermes-back-widget" style="position:fixed;bottom:14px;right:14px;'
-    'z-index:99999;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;'
-    'font-size:11px;display:flex;gap:8px;">'
-    f'<a href="/setup" style="{_WIDGET_LINK_STYLE}">← Setup</a>'
-    f'<a href="/logout" style="{_WIDGET_LINK_STYLE}">Sign out</a>'
-    '</div>'
-)
-
-DASHBOARD_UNAVAILABLE_HTML = """<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"><title>Dashboard starting…</title>
-<style>body{background:#0d0f14;color:#c9d1d9;font-family:ui-monospace,Menlo,monospace;
-display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
-.card{max-width:480px;padding:32px;border:1px solid #252d3d;border-radius:12px;
-background:#14181f;text-align:center}
-h1{font-size:16px;color:#d29922;margin:0 0 12px;font-weight:600}
-p{font-size:13px;color:#6b7688;line-height:1.6;margin:0 0 16px}
-a{color:#6272ff;text-decoration:none;border:1px solid #252d3d;border-radius:6px;
-padding:7px 14px;font-size:12px;display:inline-block}
-a:hover{border-color:#6272ff}</style></head>
-<body><div class="card">
-<h1>⚠ Hermes dashboard unavailable</h1>
-<p>The native Hermes dashboard is not responding on port %d.<br>
-It may still be starting up, or it may have crashed.</p>
-<p>Try refreshing in a few seconds, or head back to setup.</p>
-<a href="/setup">← Back to Setup</a>
-</div>
-<script>setTimeout(()=>location.reload(),4000);</script>
-</body></html>""" % HERMES_DASHBOARD_PORT
-
-
-async def _proxy_to_dashboard(request: Request) -> Response:
-    """Forward an authenticated request to the Hermes dashboard subprocess.
-
-    Assumes edge auth (basic auth middleware) has already validated the caller.
-    HTTP-only: the native Hermes dashboard does not use WebSockets.
-    """
-    client = get_http_client()
-    target = f"{HERMES_DASHBOARD_URL}{request.url.path}"
-    if request.url.query:
-        target = f"{target}?{request.url.query}"
-
-    req_headers = {
-        k: v for k, v in request.headers.items()
-        if k.lower() not in HOP_BY_HOP
-    }
-    body = await request.body()
-
-    try:
-        upstream = await client.request(
-            request.method,
-            target,
-            headers=req_headers,
-            content=body,
-        )
-    except (httpx.ConnectError, httpx.ConnectTimeout):
-        return HTMLResponse(DASHBOARD_UNAVAILABLE_HTML, status_code=503)
-    except httpx.RequestError as e:
-        print(f"[proxy] upstream error for {request.method} {request.url.path}: {e}", flush=True)
-        return HTMLResponse(DASHBOARD_UNAVAILABLE_HTML, status_code=502)
-
-    # Surface non-2xx responses from hermes into Railway logs so we can
-    # diagnose 401/500s without needing browser DevTools access.
-    if upstream.status_code >= 400:
-        body_snip = upstream.content[:200].decode("utf-8", errors="replace")
-        print(
-            f"[proxy] {request.method} {request.url.path} -> {upstream.status_code} "
-            f"body={body_snip!r}",
-            flush=True,
-        )
-
-    # Strip hop-by-hop and length/encoding headers — Starlette recomputes them.
-    resp_headers = {
-        k: v for k, v in upstream.headers.items()
-        if k.lower() not in HOP_BY_HOP
-        and k.lower() not in ("content-encoding", "content-length")
-    }
-
-    content = upstream.content
-    content_type = upstream.headers.get("content-type", "").lower()
-
-    # Inject the "← Setup" widget into HTML pages so users can always return.
-    if "text/html" in content_type and b"</body>" in content:
-        try:
-            text = content.decode("utf-8", errors="replace")
-            text = text.replace("</body>", BACK_TO_SETUP_WIDGET + "</body>", 1)
-            content = text.encode("utf-8")
-        except Exception:
-            pass  # on any error, fall back to raw upstream content
-
-    return Response(
-        content=content,
-        status_code=upstream.status_code,
-        headers=resp_headers,
-    )
-
-
-async def route_root(request: Request) -> Response:
-    """GET /: first-visit smart redirect, otherwise proxy to the dashboard.
-
-    - Unconfigured + bare GET `/` → bounce to `/setup` so new users land on
-      the wizard instead of a half-empty dashboard.
-    - Sidebar / in-app links pass `?force=1` to opt out of that redirect —
-      users who explicitly want the dashboard (e.g. to set providers via
-      the Keys tab) can still reach it without saving config first.
-    - Non-GET (SPA API calls, etc.) always proxy through.
-    """
-    if err := guard(request): return err
-    if (request.method == "GET"
-            and request.query_params.get("force") != "1"
-            and not is_config_complete()):
-        return RedirectResponse("/setup", status_code=302)
-    return await _proxy_to_dashboard(request)
-
-
-async def route_proxy(request: Request) -> Response:
-    """Catch-all: forward any unmatched path to the Hermes dashboard."""
-    if err := guard(request): return err
-    return await _proxy_to_dashboard(request)
-
-
 async def route_setup_404(request: Request) -> Response:
-    """Typos under /setup/* should 404 here — not fall through to the proxy."""
+    """Typos under /setup/* should 404 here."""
     if err := guard(request): return err
     return Response("Not Found", status_code=404, media_type="text/plain")
 
@@ -1342,172 +1211,20 @@ async def auto_start():
 
 @asynccontextmanager
 async def lifespan(app):
-    # Dashboard runs always — it's the user-facing UI after setup is done,
-    # and it's independent of gateway state.
-    asyncio.create_task(dash.start())
+    asyncio.create_task(serve.start())
     await auto_start()
     try:
         yield
     finally:
         await asyncio.gather(
             gw.stop(),
-            dash.stop(),
+            serve.stop(),
             return_exceptions=True,
         )
         global _http_client
         if _http_client is not None:
             await _http_client.aclose()
             _http_client = None
-
-
-# ── WebSocket reverse proxy ──────────────────────────────────────────────────
-# The hermes dashboard exposes several WebSocket endpoints when started with
-# --tui. The browser SPA opens these and they must flow through our reverse
-# proxy. /api/pub is opened only by the PTY child against loopback and is
-# intentionally NOT proxied — exposing it would let an authed user spam events
-# into channels. It lives at /api/pub (not under /api/plugins/), so the plugin
-# prefix route below does not match it.
-#
-#   /api/pty                  binary stream — embedded TUI keystrokes/output
-#   /api/ws                   JSON-RPC      — gateway sidecar driving Chat metadata
-#   /api/events               text frames   — dashboard subscriber for /api/pub fan-out
-#   /api/plugins/<name>/...   plugin-contributed sockets. Mounted by hermes
-#                             under /api/plugins/<name>/ (web_server.
-#                             _mount_plugin_api_routes), e.g. kanban's
-#                             /api/plugins/kanban/events live task feed. Added
-#                             in v0.15 — without a proxy route Starlette 403s
-#                             the upgrade and the SPA retries in a tight loop.
-#
-# Auth model (matches the HTTP proxy):
-#   * Edge: our HMAC cookie via _is_authenticated. WebSocket inherits .cookies
-#     from starlette HTTPConnection so the same helper works unchanged.
-#   * Upstream: hermes's own ?token=<_SESSION_TOKEN> query param. The SPA
-#     fetches that token via /api/auth/session-token and includes it in the
-#     WS URL, so we just forward path + query verbatim.
-PROXIED_WS_PATHS = ("/api/pty", "/api/ws", "/api/events", "/api/plugins/*")
-
-
-async def _ws_pump_client_to_upstream(
-    client: WebSocket,
-    upstream: websockets.WebSocketClientProtocol,
-) -> None:
-    """Forward client → upstream until the client side disconnects.
-
-    Handles both binary (PTY bytes) and text (JSON-RPC) frames.
-    """
-    try:
-        while True:
-            msg = await client.receive()
-            if msg.get("type") == "websocket.disconnect":
-                return
-            data = msg.get("bytes")
-            if data is not None:
-                await upstream.send(data)
-                continue
-            text = msg.get("text")
-            if text is not None:
-                await upstream.send(text)
-    except (WebSocketDisconnect, websockets.exceptions.ConnectionClosed):
-        return
-    except Exception as e:
-        print(f"[ws-proxy] client→upstream error on {client.url.path}: {e!r}", flush=True)
-        return
-
-
-async def _ws_pump_upstream_to_client(
-    upstream: websockets.WebSocketClientProtocol,
-    client: WebSocket,
-) -> None:
-    """Forward upstream → client until upstream closes."""
-    try:
-        async for msg in upstream:
-            if isinstance(msg, bytes):
-                await client.send_bytes(msg)
-            else:
-                await client.send_text(msg)
-    except (websockets.exceptions.ConnectionClosed, WebSocketDisconnect):
-        return
-    except Exception as e:
-        print(f"[ws-proxy] upstream→client error on {client.url.path}: {e!r}", flush=True)
-        return
-
-
-async def ws_proxy(websocket: WebSocket) -> None:
-    """Reverse-proxy a single WebSocket from browser → hermes dashboard.
-
-    Order matters: connect upstream BEFORE accepting the client. If hermes
-    is wedged or rejects the upgrade, we close the client with a meaningful
-    code instead of accepting and then dropping silently.
-
-    Connection lifecycle:
-      1. Verify edge cookie auth → 4401 close on failure
-      2. Open upstream WS with bounded open_timeout → 1011 on failure
-      3. Accept client
-      4. Spawn two pump tasks (bidirectional byte forwarding)
-      5. When either direction ends (client navigates away, upstream PTY
-         exits, etc.), cancel the other task and close both sockets
-    """
-    # 1. Edge auth.
-    if not _is_authenticated(websocket):
-        # Close before accept — browser sees the handshake fail (expected
-        # for unauthenticated calls).
-        await websocket.close(code=4401)
-        return
-
-    # 2. Build upstream URL preserving the SPA's path + query (the query
-    #    contains the hermes session token + channel id).
-    path = websocket.url.path
-    qs = websocket.url.query
-    upstream_url = f"ws://{HERMES_DASHBOARD_HOST}:{HERMES_DASHBOARD_PORT}{path}"
-    if qs:
-        upstream_url = f"{upstream_url}?{qs}"
-
-    try:
-        upstream = await websockets.connect(
-            upstream_url,
-            open_timeout=5,
-            # Don't forward client cookies/headers — hermes WS auth is
-            # purely token-based via the URL, and forwarding random
-            # headers risks future upstream surprises.
-        )
-    except (asyncio.TimeoutError, OSError, websockets.exceptions.WebSocketException) as e:
-        # Hermes dashboard down, restarting, or rejected the upgrade
-        # (e.g. bad/missing session token).
-        print(f"[ws-proxy] upstream connect failed for {path}: {e!r}", flush=True)
-        # 1011 = internal error; client SPA will surface a generic close.
-        await websocket.close(code=1011)
-        return
-
-    # 3. Both sides ready — accept and start pumping.
-    await websocket.accept()
-
-    pump_in = asyncio.create_task(_ws_pump_client_to_upstream(websocket, upstream))
-    pump_out = asyncio.create_task(_ws_pump_upstream_to_client(upstream, websocket))
-
-    try:
-        # First side to finish wins; cancel the other.
-        done, pending = await asyncio.wait(
-            (pump_in, pump_out),
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for task in pending:
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
-    finally:
-        # websockets.connect() outside `async with` doesn't auto-close;
-        # do it explicitly. Same for the client side if still open.
-        try:
-            await upstream.close()
-        except Exception:
-            pass
-        if websocket.client_state == WebSocketState.CONNECTED:
-            try:
-                await websocket.close()
-            except Exception:
-                pass
 
 
 ANY_METHOD = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
@@ -1519,7 +1236,7 @@ routes = [
     Route("/login",                             login_post,          methods=["POST"]),
     Route("/logout",                            logout),
 
-    # Our setup wizard + management API, all under /setup/* (cookie-auth guarded).
+    # Setup wizard + management API under /setup/* (cookie-auth guarded).
     Route("/setup",                             page_index),
     Route("/setup/",                            page_index),
     Route("/setup/api/config",                  api_config_get,      methods=["GET"]),
@@ -1538,49 +1255,25 @@ routes = [
     Route("/setup/api/oauth/xai/start",         api_oauth_xai_start,  methods=["POST"]),
     Route("/setup/api/oauth/xai/status",        api_oauth_xai_status),
     Route("/setup/api/oauth/xai",               api_oauth_xai_delete, methods=["DELETE"]),
-
-    # /setup/* typos return a real 404 — not a silent proxy fallthrough.
     Route("/setup/{path:path}",                 route_setup_404,     methods=ANY_METHOD),
-
-    # Reverse-proxy hermes's dashboard WebSockets (Chat tab + sidecar).
-    # WebSocketRoute is matched independently of HTTP routes, so order
-    # relative to the catch-all HTTP `Route("/{path:path}", ...)` below
-    # doesn't matter — but listing them as a group keeps the surface
-    # area auditable. Only paths in PROXIED_WS_PATHS are forwarded;
-    # /api/pub is intentionally omitted (not under /api/plugins/, so the
-    # prefix route below does not match it).
-    WebSocketRoute("/api/pty",                  ws_proxy),
-    WebSocketRoute("/api/ws",                   ws_proxy),
-    WebSocketRoute("/api/events",               ws_proxy),
-    # Plugin-contributed sockets, mounted by hermes under /api/plugins/<name>/
-    # (e.g. kanban's /api/plugins/kanban/events). Prefix-matched so new plugin
-    # WS endpoints in future hermes releases proxy without re-touching this list.
-    WebSocketRoute("/api/plugins/{path:path}",  ws_proxy),
-
-    # Root: redirect to /setup if unconfigured, otherwise proxy the dashboard.
-    Route("/",                                  route_root,          methods=ANY_METHOD),
-
-    # Catch-all: everything else proxies to the Hermes dashboard subprocess.
-    Route("/{path:path}",                       route_proxy,         methods=ANY_METHOD),
 ]
 
-# No middleware — auth is enforced per-handler via guard(). This keeps /health
-# and /login truly unauthenticated without middleware gymnastics.
+# Auth enforced per-handler via guard(). Caddy routes /setup and /health here;
+# all other paths go to `hermes serve` on HERMES_SERVE_PORT.
 app = Starlette(routes=routes, lifespan=lifespan)
 
 if __name__ == "__main__":
     import uvicorn
-    # When Caddy fronts the container (PROXY_HOST_ROUTES), it owns $PORT and we
-    # bind ADMIN_INTERNAL_PORT instead. Without that, Railway's $PORT is us.
-    port = int(os.environ.get("ADMIN_INTERNAL_PORT") or os.environ.get("PORT", "8080"))
+    # Caddy owns Railway's $PORT; admin binds ADMIN_INTERNAL_PORT only.
+    port = int(os.environ.get("ADMIN_INTERNAL_PORT", "8080"))
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info", loop="asyncio")
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="info", loop="asyncio")
     server = uvicorn.Server(config)
 
     def _shutdown():
         loop.create_task(gw.stop())
-        loop.create_task(dash.stop())
+        loop.create_task(serve.stop())
         server.should_exit = True
 
     for sig in (signal.SIGTERM, signal.SIGINT):

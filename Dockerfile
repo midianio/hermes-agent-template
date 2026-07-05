@@ -27,8 +27,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*
 
-# Caddy — optional host-based edge proxy when PROXY_HOST_ROUTES is set (Railway
-# exposes one $PORT; Caddy routes custom domains to internal Hermes API ports).
+# Caddy — edge proxy on Railway's $PORT: routes /setup to admin, default to hermes serve.
 ARG CADDY_VERSION=2.9.1
 RUN curl -fsSL "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_linux_amd64.tar.gz" \
     | tar -xz -C /usr/bin caddy
@@ -169,6 +168,9 @@ ENV HERMES_HOME=/data/.hermes
 # trigger on first /chat connection.
 ENV HERMES_TUI_DIR=/opt/hermes-agent/ui-tui
 ENV EDITOR=vim
+ENV PORT=9119
+ENV ADMIN_INTERNAL_PORT=8080
+ENV HERMES_SERVE_PORT=9120
 
 # tini wraps start.sh so it runs as PID 1's child instead of as PID 1 itself.
 # `-g` propagates signals to the whole process group so `docker stop` /

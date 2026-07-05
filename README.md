@@ -17,7 +17,8 @@ Deploy [Hermes Agent](https://github.com/NousResearch/hermes-agent) on [Railway]
 - **Live Status** — stat cards for gateway state, uptime, model, and pending pairing requests
 - **Live Logs** — streaming gateway log viewer
 - **User Pairing** — approve or deny users who message your bot, revoke access anytime
-- **Basic Auth** — password-protected admin panel
+- **Hermes Desktop remote** — connect your Mac app to the Railway backend on port 9119
+- **Basic Auth** — password-protected admin panel at `/setup`
 - **Reset Config** — one-click reset to start fresh
 
 ## Getting Started
@@ -44,7 +45,7 @@ Hermes Agent interacts entirely through messaging channels — there is no chat 
 1. Click the **Deploy on Railway** button above
 2. Set the `ADMIN_PASSWORD` environment variable (or a random one will be generated and printed to deploy logs)
 3. Attach a **volume** mounted at `/data` (persists config across redeploys)
-4. Open your app URL — log in with username `admin` and your password
+4. Open **`https://your-app.up.railway.app/setup`** — log in with username `admin` and your password
 
 ### 4. Configure in the Admin Dashboard
 
@@ -63,11 +64,14 @@ Message your Telegram bot. If you're a new user, a pairing request will appear i
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PORT` | `8080` | Web server port (set automatically by Railway) |
-| `PROXY_HOST_ROUTES` | *(unset)* | Comma-separated `hostname:internal_port` pairs for Caddy host routing — see [Multiple domains on one port](#multiple-domains-on-one-port) |
-| `ADMIN_INTERNAL_PORT` | `8080` | Port for the admin server when `PROXY_HOST_ROUTES` is set (Caddy owns `$PORT`) |
-| `ADMIN_USERNAME` | `admin` | Basic auth username |
-| `ADMIN_PASSWORD` | *(auto-generated)* | Basic auth password — if unset, a random password is printed to logs |
+| `PORT` | `9119` | Public port (Caddy). Railway sets this automatically — Hermes Desktop expects `:9119`. |
+| `HERMES_SERVE_PORT` | `9120` | Internal port for `hermes serve` (Desktop + web UI backend) |
+| `ADMIN_INTERNAL_PORT` | `8080` | Internal port for the admin setup UI (`/setup`, `/health`) |
+| `PROXY_HOST_ROUTES` | *(unset)* | Optional comma-separated `hostname:internal_port` for API server host routing — see [API server hostnames](#api-server-hostnames-optional) |
+| `ADMIN_USERNAME` | `admin` | Admin UI login username (`/setup`) |
+| `ADMIN_PASSWORD` | *(auto-generated)* | Admin UI password — if unset, a random password is printed to logs |
+| `HERMES_DASHBOARD_BASIC_AUTH_*` | *(unset)* | Hermes auth for Desktop + web UI — set in `/data/.hermes/.env` or Railway vars; see [Connect Hermes Desktop](#connect-hermes-desktop-macos) |
+| `HERMES_DASHBOARD_PUBLIC_URL` | *(unset)* | Public URL of your Railway app — required for OAuth callbacks (e.g. `https://your-app.up.railway.app`) |
 | `HERMES_REF` | *(pinned in Dockerfile)* | Hermes Agent version to install (any upstream git tag/branch). Set this to override the Dockerfile default without editing code — see [Updating Hermes](#updating-hermes). |
 | `MIDAS_GITHUB_TOKEN` | *(unset)* | Build-time only: fine-grained GitHub PAT with read-only **Contents** access to `midianio/midas`, used to download the `midas` release binary into the image. If unset, the midas install is skipped and the image still builds. |
 | `MIDAS_VERSION` | `latest` | midas release to bake into the image. Defaults to the newest GitHub release at build time; set a release tag (e.g. `0.1.2`) to pin. |
@@ -103,85 +107,118 @@ Parallel (search), Firecrawl (scraping), Tavily (search), FAL (image gen), Brows
 ## Architecture
 
 ```
-Railway Container
-├── Python Admin Server (Starlette + Uvicorn)
-│   ├── /            — Admin dashboard (Basic Auth)
-│   ├── /health      — Health check (no auth)
-│   └── /api/*       — Config, status, logs, gateway, pairing
-└── hermes gateway   — Managed as async subprocess
+Railway Container ($PORT, default 9119)
+├── Caddy (edge router on $PORT)
+│   ├── /setup, /health, /login  →  Admin server (:8080)
+│   └── everything else            →  hermes serve (:9120) — Desktop + web UI
+├── Python Admin Server (Starlette + Uvicorn, loopback :8080)
+│   ├── /setup      — Setup wizard (admin cookie auth)
+│   ├── /health     — Health check (no auth)
+│   └── /setup/api/* — Config, status, logs, gateway, pairing
+├── hermes serve    — Headless backend for Hermes Desktop + browser chat
+└── hermes gateway  — Messaging channels (Telegram, Discord, …)
 ```
 
-The admin server runs on `$PORT` and manages the Hermes gateway as a child process. Config is stored in `/data/.hermes/.env` and `/data/.hermes/config.yaml`. Gateway stdout/stderr is captured into a ring buffer and streamed to the Logs panel.
+Caddy owns Railway's public port. The admin UI lives at **`/setup`** (log in with `ADMIN_USERNAME` / `ADMIN_PASSWORD`). The root URL serves **`hermes serve`**, which uses separate Hermes auth for Desktop and browser clients.
 
-## Multiple domains on one port
+Config is stored in `/data/.hermes/.env` and `/data/.hermes/config.yaml`. Gateway stdout/stderr is captured into a ring buffer and streamed to the Logs panel.
 
-Railway exposes **one HTTP port** per service (`$PORT`). To reach two internal apps (for example Hermes API servers on **8642** and **8643**) via different hostnames, enable the built-in **Caddy** edge proxy.
+## Connect Hermes Desktop (macOS)
 
-### 1. Make each Hermes API server reachable inside the container
+1. **Configure Hermes auth** in `/data/.hermes/.env` (via the admin UI env editor, or Railway variables):
 
-In `/data/.hermes/.env` (or per-profile `.env` if you run multiple gateways), each API server must listen on all interfaces — not loopback:
+   **Public Railway URL (recommended — OAuth):**
+
+   ```bash
+   HERMES_DASHBOARD_OAUTH_CLIENT_ID=agent:...
+   HERMES_DASHBOARD_PUBLIC_URL=https://your-app.up.railway.app
+   ```
+
+   Register the OAuth client with `hermes dashboard register` from a one-off `docker exec` or local Hermes install pointing at the same `HERMES_HOME`.
+
+   **Tailscale / VPN only (basic auth):**
+
+   ```bash
+   HERMES_DASHBOARD_BASIC_AUTH_USERNAME=admin
+   HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=<strong-password>
+   HERMES_DASHBOARD_BASIC_AUTH_SECRET=<openssl rand -base64 32>
+   ```
+
+2. **In Hermes Desktop** → Settings → Gateway → **Remote gateway**:
+   - Remote URL: `https://your-app.up.railway.app` (port 9119 is the default `$PORT`; Railway's HTTPS URL works without `:9119`)
+   - Sign in (OAuth or the basic-auth credentials above)
+   - Save and reconnect
+
+3. **Verify** from your Mac:
+
+   ```bash
+   curl -s https://your-app.up.railway.app/api/status | jq '.auth_required, .auth_providers'
+   ```
+
+   You should see `"auth_required": true` and your provider listed.
+
+Admin login (`/setup`) and Hermes serve auth are **separate**. `ADMIN_PASSWORD` protects the setup wizard only; Desktop uses `HERMES_DASHBOARD_*` credentials.
+
+## API server hostnames (optional)
+
+Railway exposes **one HTTP port** per service. To reach Hermes API servers on **8642** / **8643** via different hostnames (Open WebUI, gateway proxy mode, etc.), use `PROXY_HOST_ROUTES`.
+
+### 1. Enable the API server in `/data/.hermes/.env`
 
 ```bash
 API_SERVER_ENABLED=true
 API_SERVER_HOST=0.0.0.0
-API_SERVER_PORT=8642          # use 8643 in the second profile's .env
+API_SERVER_PORT=8642          # use 8643 in a second profile's .env
 API_SERVER_KEY=<random-secret> # openssl rand -hex 32
 ```
 
-Without `API_SERVER_HOST=0.0.0.0`, Caddy cannot forward traffic to the gateway even though the port is open on localhost.
-
-### 2. Tell the container how to route hostnames
-
-Set `PROXY_HOST_ROUTES` on the Railway service (comma-separated `host:port`):
+### 2. Route hostnames via Caddy
 
 ```bash
 PROXY_HOST_ROUTES=api-one.example.com:8642,api-two.example.com:8643
 ```
 
-On boot, Caddy listens on Railway's `$PORT` and forwards:
-
 | Host header | Internal backend |
 |-------------|------------------|
 | `api-one.example.com` | `127.0.0.1:8642` |
 | `api-two.example.com` | `127.0.0.1:8643` |
-| anything else (including the default `*.up.railway.app` URL) | admin UI on `:8080` |
+| default Railway URL | `hermes serve` (Desktop / web UI) |
+| `/setup` on any host | admin UI |
 
-`ADMIN_INTERNAL_PORT` defaults to `8080`; change it only if that port conflicts with another process.
-
-### 3. Add custom domains in Railway
-
-For each public hostname:
-
-1. Open **Service → Settings → Networking → Custom Domain**
-2. Add the domain (e.g. `api-one.example.com`, `api-two.example.com`)
-3. Point your DNS CNAME at Railway's target
-
-Railway terminates TLS at the edge; Caddy inside the container speaks plain HTTP on `$PORT`.
-
-Keep the default Railway domain on the service for the **admin dashboard** (`/setup`, `/health`). Point custom domains only at the API hostnames you listed in `PROXY_HOST_ROUTES`.
+Add custom domains in Railway **Settings → Networking → Custom Domain** and point DNS at Railway's target.
 
 ### Local smoke test
 
 ```bash
 docker build -t hermes-agent .
-docker run --rm -p 8080:8080 \
-  -e PORT=8080 \
-  -e PROXY_HOST_ROUTES='api.localtest.me:8642,api2.localtest.me:8643' \
+docker run --rm -p 9119:9119 \
+  -e PORT=9119 \
   -e ADMIN_PASSWORD=changeme \
+  -e HERMES_DASHBOARD_BASIC_AUTH_USERNAME=hermes \
+  -e HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=changeme \
   -v hermes-data:/data \
   hermes-agent
 ```
 
-`localtest.me` resolves to `127.0.0.1`, so you can curl `http://api.localtest.me:8080/health` (gateway) vs `http://127.0.0.1:8080/health` (admin) after enabling the API server in `.env`.
+- Admin setup: `http://localhost:9119/setup` (admin / changeme)
+- Serve status: `curl http://localhost:9119/api/status`
+- Desktop remote URL: `http://localhost:9119` (sign in as hermes / changeme)
 
 ## Running Locally
 
 ```bash
 docker build -t hermes-agent .
-docker run --rm -it -p 8080:8080 -e PORT=8080 -e ADMIN_PASSWORD=changeme -v hermes-data:/data hermes-agent
+docker run --rm -it -p 9119:9119 \
+  -e PORT=9119 \
+  -e ADMIN_PASSWORD=changeme \
+  -e HERMES_DASHBOARD_BASIC_AUTH_USERNAME=hermes \
+  -e HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=changeme \
+  -v hermes-data:/data \
+  hermes-agent
 ```
 
-Open `http://localhost:8080` and log in with `admin` / `changeme`.
+- Admin setup: `http://localhost:9119/setup` — log in with `admin` / `changeme`
+- Hermes serve (Desktop): `http://localhost:9119` — sign in with `hermes` / `changeme`
 
 ## Updating Hermes
 
